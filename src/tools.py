@@ -152,56 +152,100 @@ def gen_dx_bx(xbound, ybound, zbound):
 
 def cumsum_trick(x, geom_feats, ranks):
     """
-    Efficiently sums features belonging to the same voxel using cumsum.
+    高效地对属于同一个体素的特征进行求和，使用cumsum技巧。
 
     Args:
-        x (torch.Tensor): Flattened features (N_points, C).
-        geom_feats (torch.Tensor): Voxel indices for each point (N_points, 4), cols are (x, y, z, batch_idx).
-        ranks (torch.Tensor): Unique rank for each voxel per batch item (N_points,).
+        x (torch.Tensor): 展平的特征 (N_points, C)。
+        geom_feats (torch.Tensor): 每个点的体素索引 (N_points, 4)，列是 (x, y, z, batch_idx)。
+        ranks (torch.Tensor): 每个批次项的每个体素的唯一排名 (N_points,)。
 
     Returns:
-        x (torch.Tensor): Summed features per voxel (N_voxels, C).
-        geom_feats (torch.Tensor): Corresponding voxel indices (N_voxels, 4).
+        x (torch.Tensor): 每个体素的求和特征 (N_voxels, C)。
+        geom_feats (torch.Tensor): 对应的体素索引 (N_voxels, 4)。
     """
+    # 安全检查：确保输入非空
+    if x.shape[0] == 0:
+        return x, geom_feats
+
+    # 对输入进行cumsum
     x = x.cumsum(0)
+
+    # 找出每个体素的第一个点
     kept = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
-    kept[:-1] = (ranks[1:] != ranks[:-1])
 
-    x = x[kept]
-    x = torch.cat((x[:1], x[1:] - x[:-1]))
+    # 安全检查：确保至少有两个元素才执行比较操作
+    if x.shape[0] > 1:
+        kept[:-1] = (ranks[1:] != ranks[:-1])
 
-    # rank = ranks[kept]
-    geom_feats = geom_feats[kept]
-    # print(x.shape)
+    # 选择保留的点
+    x_kept = x[kept]
 
-    return x, geom_feats
+    # 安全检查：处理x_kept可能为单个元素的情况
+    if x_kept.shape[0] <= 1:
+        return x_kept, geom_feats[kept]
+
+    # 计算差分以获得每个体素内的特征和
+    # 第一个点保持不变，后续点减去前一个点
+    x_result = torch.cat((x_kept[:1], x_kept[1:] - x_kept[:-1]))
+
+    # 返回结果
+    return x_result, geom_feats[kept]
 
 
 class QuickCumsum(torch.autograd.Function):
     """
-    Custom autograd Function for cumsum trick with backward pass.
-    (Note: Backward pass might be simplified or require verification)
+    为cumsum技巧提供的自定义autograd函数，带有反向传播。
     """
     @staticmethod
     def forward(ctx, x, geom_feats, ranks):
+        # 安全检查：确保输入非空
+        if x.shape[0] == 0:
+            # 保存空张量标记以供backward使用
+            ctx.save_for_backward(torch.tensor(
+                [], device=x.device, dtype=torch.bool))
+            return x, geom_feats
+
+        # 对输入进行cumsum
         x = x.cumsum(0)
+
+        # 找出每个体素的第一个点
         kept = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
-        kept[:-1] = (ranks[1:] != ranks[:-1])
 
-        x = x[kept]
-        x = torch.cat((x[:1], x[1:] - x[:-1]))
+        # 安全检查：确保至少有两个元素才执行比较操作
+        if x.shape[0] > 1:
+            kept[:-1] = (ranks[1:] != ranks[:-1])
 
-        # rank = ranks[kept]
-        # geom_feats = geom_feats[kept]
+        # 选择保留的点
+        x_kept = x[kept]
+        geom_feats_kept = geom_feats[kept]
+
+        # 保存上下文信息供backward使用
         ctx.save_for_backward(kept)
-        # print(x.shape)
-        return x, geom_feats[kept]
+
+        # 安全检查：处理x_kept可能为单个元素的情况
+        if x_kept.shape[0] <= 1:
+            return x_kept, geom_feats_kept
+
+        # 计算差分以获得每个体素内的特征和
+        # 第一个点保持不变，后续点减去前一个点
+        x_result = torch.cat((x_kept[:1], x_kept[1:] - x_kept[:-1]))
+
+        return x_result, geom_feats_kept
 
     @staticmethod
     def backward(ctx, gradx, gradgeom):
         kept, = ctx.saved_tensors
+
+        # 安全检查：处理空张量情况
+        if kept.shape[0] == 0:
+            return gradx, None, None
+
+        # 计算反向传播梯度
         back = torch.cumsum(kept, 0)
-        back[kept] -= 1
+
+        # 安全检查：确保kept不是空的
+        if torch.any(kept):
+            back[kept] -= 1
 
         val = gradx[back]
 

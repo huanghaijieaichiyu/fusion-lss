@@ -39,107 +39,36 @@ class NuscData(torch.utils.data.Dataset):
         print(self, 'found samples', len(self.ixes))
 
     def fix_nuscenes_formatting(self):
-        """If nuscenes is stored with trainval/10sec folders, combine strings appropriately.
+        """Checks for standard scene JSON files. If not found, prints a message
+        but relies on the NuScenes SDK to resolve data paths later, rather than
+        attempting complex path modifications for legacy formats.
         """
-        # Check if self.scenes is empty before proceeding
         if not self.scenes:
             print("Warning: self.scenes is empty in fix_nuscenes_formatting. Skipping.")
             return
 
-        # check if default file format exists in scenes
-        scene_folder_token = self.scenes[0].split(
-            '/')[-1].replace('scene-', '')
-        token_len = len(scene_folder_token)
-        scene_folder = os.path.join(
-            self.nusc.dataroot, self.scenes[0][:-(token_len+1)])
+        print("Info: Verifying scene file paths...")
+        all_scenes_found = True
+        # Check only the first scene's format for efficiency, assuming consistency
+        # If you need to check every scene, loop through self.scenes
+        if self.scenes:
+            first_scene_name = self.nusc.get('scene', self.nusc.sample[0]['scene_token'])[
+                'name']  # Get scene name reliably
+            scene_json_path = os.path.join(
+                self.nusc.dataroot, 'scene', f'{first_scene_name}.json')
 
-        # default file format check
-        scene_json_path = os.path.join(
-            scene_folder, 'scene-{}.json'.format(scene_folder_token))
-        if not os.path.exists(scene_json_path):
-            print(
-                f"Info: Standard scene file {scene_json_path} not found. Checking for older 10sec format.")
-            # change paths to use the 10sec folders
-            # determine keyframe or sweep
-            # Use glob directly from the glob module
-            import glob as pyglob  # Use an alias to avoid conflict if self.glob exists
-            fs = pyglob.glob(os.path.join(scene_folder, '*__{}*__*'.format('LIDAR_TOP',
-                                                                           'sweep' if 'sweeps' in scene_folder else 'keyframe')))
-
-            # Check if glob found any files before proceeding
-            if not fs:
+            if not os.path.exists(scene_json_path):
+                all_scenes_found = False
                 print(
-                    f"Warning: No LIDAR_TOP files found matching pattern in {scene_folder}. Skipping scene path modification logic.")
-                # If no files are found, we assume the structure is unexpected or doesn't match the old format.
-                # We do *not* modify self.scenes in this case.
+                    f"Info: Standard scene file format (e.g., {scene_json_path}) not detected for the first scene ('{first_scene_name}'). "
+                    f"Assuming standard V1.0 structure (samples/sweeps) and relying on NuScenes SDK for data lookup."
+                )
             else:
-                # Original logic, now safe because fs is not empty
-                _is_keyframe = 'keyframe' in os.path.basename(
-                    fs[0])  # Check basename for keyframe/sweep string
-
-                # update scene strings
-                new_scenes = []
                 print(
-                    "Info: Attempting to update scene paths based on detected 10sec format.")
-                for scene in self.scenes:
-                    scene_folder_token_loop = scene.split(
-                        '/')[-1].replace('scene-', '')
-                    token_len_loop = len(scene_folder_token_loop)
-                    # Construct the path to the scene folder more reliably
-                    # Assuming scene is like 'samples/scene-XXXX' or similar relative path from dataroot
-                    scene_base_path = os.path.join(self.nusc.dataroot, scene)
-                    # Get the directory containing the scene folder
-                    scene_folder_loop = os.path.dirname(scene_base_path)
+                    f"Info: Standard scene file format detected (e.g., {scene_json_path}).")
 
-                    new_paths = []
-                    glob_pattern = ''  # Define glob_pattern before use
-
-                    if _is_keyframe:
-                        glob_pattern = os.path.join(
-                            scene_folder_loop, '*__{}*__*keyframe*'.format('LIDAR_TOP'))
-                        inner_fs = pyglob.glob(glob_pattern)
-                        if inner_fs:
-                            # Use os.path.basename
-                            new_paths = sorted([os.path.basename(f)
-                                               for f in inner_fs])
-                            new_paths = [
-                                f.replace('__LIDAR_TOP__keyframe', '') for f in new_paths]
-                    else:
-                        glob_pattern = os.path.join(
-                            scene_folder_loop, '*__{}*__*sweep*'.format('LIDAR_TOP'))
-                        inner_fs = pyglob.glob(glob_pattern)
-                        if inner_fs:
-                            # Use os.path.basename
-                            new_paths = sorted([os.path.basename(f)
-                                               for f in inner_fs])
-                            new_paths = [
-                                f.replace('__LIDAR_TOP__sweep', '') for f in new_paths]
-
-                    if new_paths:
-                        # Construct the new scene string relative to dataroot?
-                        # Original code's output path construction was ambiguous.
-                        # Let's assume the goal is just to use the original scene identifier
-                        # if modification fails or isn't needed, or construct a new identifier if successful.
-                        # The original scene string seems sufficient if we don't need the 10sec format.
-                        # Re-evaluating the purpose: It seems to modify self.scenes list strings.
-                        # Let's try to stick closer to the original output format if possible.
-                        # The new path seems to be: scene_path_prefix/scene_token/first__last
-                        # Path part before 'scene-XXXX'
-                        scene_prefix = scene[:-(token_len_loop+1)]
-                        new_scene_string = os.path.join(
-                            scene_prefix, scene_folder_token_loop, new_paths[0]+'__' + new_paths[-1])
-                        # Use forward slashes for consistency
-                        new_scene_string = new_scene_string.replace('\\', '/')
-                        new_scenes.append(new_scene_string)
-                        # print(f"Debug: Updated scene {scene} to {new_scene_string}") # Optional debug
-                    else:
-                        print(
-                            f"Warning: Could not determine new path for scene folder {scene_folder_loop} using pattern {glob_pattern}. Appending original scene path: {scene}")
-                        # Append original if update fails for this scene
-                        new_scenes.append(scene)
-
-                # Update self.scenes only if modifications were made and successful
-                self.scenes = new_scenes
+        # No complex globbing or self.scenes modification needed here anymore.
+        # The original logic for handling older 10sec formats is removed.
 
     def get_scenes(self):
         # filter by scene split

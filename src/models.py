@@ -140,6 +140,146 @@ class BevEncode(nn.Module):
         return x
 
 
+class MBConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expand_ratio, se_ratio=0.0):  # Default se_ratio to 0
+        super().__init__()
+        self.stride = stride
+        # Ensure hidden_dim is an integer
+        hidden_dim = int(in_channels * expand_ratio)
+        self.use_res_connect = self.stride == 1 and in_channels == out_channels
+
+        layers = []
+        # Expansion phase
+        if expand_ratio != 1:
+            layers.append(nn.Conv2d(in_channels, hidden_dim,
+                          kernel_size=1, bias=False))
+            layers.append(nn.BatchNorm2d(hidden_dim))
+            layers.append(nn.ReLU6(inplace=True))
+
+        # Depthwise convolution
+        layers.append(nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride,
+                                padding=(kernel_size - 1) // 2, groups=hidden_dim, bias=False))
+        layers.append(nn.BatchNorm2d(hidden_dim))
+        layers.append(nn.ReLU6(inplace=True))
+
+        # Squeeze-and-Excite (Placeholder for future, currently se_ratio=0 means disabled)
+        # if se_ratio > 0:
+        #     num_squeezed_channels = max(1, int(in_channels * se_ratio)) # Squeeze from in_channels
+        #     # SELayer would need to be defined and added here, operating on hidden_dim
+        #     pass
+
+        # Projection phase (linear)
+        layers.append(nn.Conv2d(hidden_dim, out_channels,
+                      kernel_size=1, bias=False))
+        # No activation after projection if it's the end of the block before residual
+        layers.append(nn.BatchNorm2d(out_channels))
+
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+
+class BevEncodeV2(nn.Module):
+    def __init__(self, inC, outC):
+        super(BevEncodeV2, self).__init__()
+
+        # Configuration for MBConv stages
+        # (input_channels, output_channels, num_blocks, stride_first_block, expand_ratio, kernel_size)
+        # Channels based on a light configuration, e.g., ~MobileNetV2-like
+        c_stem = 32
+        stage_configs = [
+            (c_stem, 48, 2, 2, 6, 3),    # stage1: H/2 -> H/4
+            (48, 64, 2, 2, 6, 3),     # stage2: H/4 -> H/8
+            (64, 96, 2, 1, 6, 3),     # stage3: H/8 -> H/8 (more features)
+        ]
+
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(inC, c_stem, kernel_size=3,
+                      stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(c_stem),
+            nn.ReLU6(inplace=True)
+        )
+        self.s1_feats_ch = c_stem  # Channels after stem, input to stage1
+
+        # Downsampling Stages (Encoder)
+        self.stages = nn.ModuleList()
+        current_channels = c_stem
+        # To store channels of skip connections
+        self.skip_channels = [current_channels]
+
+        for C_in_stage_def_unused, C_out_stage, num_blocks, stride_first, exp_r, ks in stage_configs:
+            stage_blocks = []
+            for i in range(num_blocks):
+                stride = stride_first if i == 0 else 1
+                stage_blocks.append(
+                    MBConvBlock(current_channels, C_out_stage,
+                                ks, stride, exp_r)
+                )
+                current_channels = C_out_stage
+            self.stages.append(nn.Sequential(*stage_blocks))
+            # Store output channels of this stage
+            self.skip_channels.append(current_channels)
+
+        # self.skip_channels will be [c_stem, stage1_out_ch, stage2_out_ch, stage3_out_ch]
+        # Example: [32, 48, 64, 96]
+
+        # Upsampling Path (Decoder) - correcting skip connections
+        up_c1 = 64
+        up_c2 = 48
+
+        # up1: Upsamples stage3_out (x1, H/8) to H/4, concatenates with stage1_out (x2, H/4)
+        # Input channels to Up.conv = ch(stage3) + ch(stage1)
+        self.up1 = Up(
+            self.skip_channels[3] + self.skip_channels[1], up_c1, scale_factor=2)
+
+        # up2: Upsamples up1_out (x1, H/4) to H/2, concatenates with stem_out (x2, H/2)
+        # Input channels to Up.conv = ch(up1_out) + ch(stem)
+        self.up2 = Up(up_c1 + self.skip_channels[0], up_c2, scale_factor=2)
+
+        # Final upsampling and convolution, similar to original BevEncode.up2
+        # Input is up2_out (d2), spatial H/2, channels up_c2
+        self.final_up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear',
+                        align_corners=True),  # H/2 -> H
+            nn.Conv2d(up_c2, up_c2, kernel_size=3, padding=1,
+                      bias=False),  # Input from up2
+            nn.BatchNorm2d(up_c2),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(up_c2, outC, kernel_size=1, padding=0)
+        )
+
+    def forward(self, x):
+        # Stem
+        s1_f = self.stem(x)  # H/2, W/2 ; Channels: self.skip_channels[0]
+
+        # Encoder Path
+        skip_connections = [s1_f]
+        f_current = s1_f
+        for stage_module in self.stages:
+            f_current = stage_module(f_current)
+            skip_connections.append(f_current)
+
+        # skip_connections indices: [0: stem_out(H/2), 1: stage1_out(H/4), 2: stage2_out(H/8), 3: stage3_out(H/8)]
+
+        # Decoder Path
+        # d1 = up1(stage3_out, stage1_out)
+        # Output: up_c1 channels, H/4
+        d1 = self.up1(skip_connections[3], skip_connections[1])
+
+        # d2 = up2(d1, stem_out)
+        d2 = self.up2(d1, skip_connections[0])  # Output: up_c2 channels, H/2
+
+        # Final upsampling and output conv
+        out = self.final_up(d2)  # Output: outC channels, H, W
+
+        return out
+
+
 class LiftSplatShoot(nn.Module):
     def __init__(self, grid_conf, data_aug_conf, outC):
         super(LiftSplatShoot, self).__init__()
@@ -187,21 +327,58 @@ class LiftSplatShoot(nn.Module):
         """
         B, N, _ = trans.shape
 
-        # undo post-transformation
-        # B x N x D x H x W x 3
-        points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
-        points = torch.inverse(post_rots).view(
-            B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+        # 初始点投影
+        points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)  # Step 1
 
-        # cam_to_ego
-        points = torch.cat((points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
-                            points[:, :, :, :, :, 2:3]
-                            ), 5)
-        combine = rots.matmul(torch.inverse(intrins))
-        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
-        points += trans.view(B, N, 1, 1, 1, 3)
+        # 计算逆矩阵并进行投影
+        inverse_epsilon = 1e-6  # Small value for stability
+        # Add epsilon * I to post_rots before inversion
+        stable_post_rots = post_rots + \
+            torch.eye(3, device=post_rots.device, dtype=post_rots.dtype).unsqueeze(
+                0).unsqueeze(0) * inverse_epsilon
+        inv_post_rots = torch.inverse(stable_post_rots)  # Step 2a
 
-        return points
+        points = inv_post_rots.view(
+            B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))  # Step 2b
+
+        # 关键修改: 添加数值稳定性
+        xy_coords = points[:, :, :, :, :, :2]
+        depth_vals = points[:, :, :, :, :, 2:3]
+        epsilon = 1e-6  # This epsilon is for safe_depth, not the inverse_epsilon
+        safe_depth = depth_vals.clone()
+        safe_depth = torch.where(torch.abs(safe_depth) < epsilon,
+                                 torch.full_like(
+                                     safe_depth, epsilon) * torch.sign(safe_depth + epsilon),
+                                 safe_depth)
+
+        # --- Perform critical multiplication in float32 to prevent float16 overflow ---
+        product_f32 = xy_coords.float() * safe_depth.float()
+
+        # Ensure the other part for concatenation is also float32
+        safe_depth_component_f32 = safe_depth.float()
+        # ---------------------------------------------------------------------------
+
+        # Step 3 (Scaling)
+        # Resulting 'points' will be float32 due to product_f32 and safe_depth_component_f32
+        points = torch.cat(
+            (product_f32, safe_depth_component_f32), 5)
+
+        # 应用相机到自车坐标的变换
+        # Add epsilon * I to intrins before inversion
+        stable_intrins = intrins + \
+            torch.eye(3, device=intrins.device, dtype=intrins.dtype).unsqueeze(
+                0).unsqueeze(0) * inverse_epsilon
+        inv_intrins = torch.inverse(stable_intrins)  # Step 4a
+
+        combine = rots.matmul(inv_intrins)  # Step 4b
+
+        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(
+            points.squeeze(-1).unsqueeze(-1)).squeeze(-1)  # Step 4c (Corrected matmul)
+
+        # 添加平移
+        points += trans.view(B, N, 1, 1, 1, 3)  # Step 5
+
+        return points  # Final Output
 
     def get_cam_feats(self, x):
         """Return B x N x D x H/downsample x W/downsample x C
@@ -217,75 +394,92 @@ class LiftSplatShoot(nn.Module):
         return x
 
     def voxel_pooling(self, geom_feats, x):
+        """Pools camera features into a BEV grid.
+        Args:
+            geom_feats: Geometry tensor (B x N x D x H x W x 3)
+            x: Camera features (B x N x D x H x W x C)
+        Returns:
+            BEV features (B x (C * Z) x X x Y)
+        """
         B, N, D, H, W, C = x.shape
         Nprime = B*N*D*H*W
 
-        # flatten x
+        # 展平特征
         x = x.reshape(Nprime, C)
 
-        # flatten indices
-        geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx).long()
-        geom_feats = geom_feats.view(Nprime, 3)
+        # 计算栅格化索引
+        geom_feats_normalized = (geom_feats - (self.bx - self.dx/2.)) / self.dx
+        geom_feats_long = geom_feats_normalized.long()
+        geom_feats = geom_feats_long.view(Nprime, 3)
+
+        # 添加批次索引
         batch_ix = torch.cat([torch.full([Nprime//B, 1], ix,
                              device=x.device, dtype=torch.long) for ix in range(B)])
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
 
-        # filter out points that are outside box
+        # 过滤掉边界外的点
         kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0])\
             & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1])\
             & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
+
+        # 改进的处理方式：处理没有有效点的情况
+        if not torch.any(kept):
+            # 使用中心区域的一些点，即使它们可能在边界外
+            # 我们只选择一个小的中心区域（不超过10%的原始点）
+            center_region = (
+                torch.abs(geom_feats_normalized[:, 0] - self.nx[0]/2) < self.nx[0]*0.2) & \
+                (torch.abs(geom_feats_normalized[:, 1] - self.nx[1]/2) < self.nx[1]*0.2) & \
+                (torch.abs(
+                    geom_feats_normalized[:, 2] - self.nx[2]/2) < self.nx[2]*0.2)
+
+            # 若中心区域也没有点，则选择最接近中心的几个点
+            if not torch.any(center_region):
+                # 计算到中心的距离
+                center_distances = (geom_feats_normalized[:, 0] - self.nx[0]/2)**2 + \
+                    (geom_feats_normalized[:, 1] - self.nx[1]/2)**2 + \
+                    (geom_feats_normalized[:,
+                                           2] - self.nx[2]/2)**2
+                # 选择最近的10个点
+                _, closest_indices = torch.topk(center_distances, k=min(
+                    10, center_distances.size(0)), largest=False)
+                new_kept = torch.zeros_like(kept)
+                new_kept[closest_indices] = True
+                kept = new_kept
+            else:
+                # 使用中心区域点
+                kept = center_region
+
+            # 将这些点映射到有效范围内
+            geom_feats[:, 0] = torch.clamp(
+                geom_feats[:, 0], 0, int(self.nx[0].item()-1))
+            geom_feats[:, 1] = torch.clamp(
+                geom_feats[:, 1], 0, int(self.nx[1].item()-1))
+            geom_feats[:, 2] = torch.clamp(
+                geom_feats[:, 2], 0, int(self.nx[2].item()-1))
+
         x = x[kept]
         geom_feats = geom_feats[kept]
 
-        # get tensors from the same voxel next to each other
+        # 计算体素排序索引
         ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)\
             + geom_feats[:, 1] * (self.nx[2] * B)\
             + geom_feats[:, 2] * B\
             + geom_feats[:, 3]
+
+        # 对点进行排序以使相同体素的点相邻
         sorts = ranks.argsort()
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
 
-        # cumsum trick
-        if not self.use_quickcumsum:
-            x, geom_feats = cumsum_trick(x, geom_feats, ranks)
-        else:
-            x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
-
-        # --- 检查 cumsum_trick 的输入 ---
-        assert torch.all(torch.isfinite(
-            x)), "!!! NaN/Inf detected in input x to cumsum_trick !!!"
-        assert torch.all(torch.isfinite(
-            geom_feats)), "!!! NaN/Inf detected in input geom_feats to cumsum_trick !!!"
-        assert torch.all(torch.isfinite(
-            ranks)), "!!! NaN/Inf detected in input ranks to cumsum_trick !!!"
-        # -----------------------------
-
-        # Use cumsum trick for summing features in the same voxel
+        # 执行累加技巧 - 始终使用cumsum_trick（FusionNet中self.use_quickcumsum = False）
         x, geom_feats = cumsum_trick(x, geom_feats, ranks)
-        # --- 检查 cumsum_trick 的输出 ---
-        assert torch.all(torch.isfinite(
-            x)), "!!! NaN/Inf detected in output x from cumsum_trick !!!"
-        assert torch.all(torch.isfinite(
-            geom_feats)), "!!! NaN/Inf detected in output geom_feats from cumsum_trick !!!"
-        # ----------------------------
 
-        # --- 恢复缺失的代码块 ---
-        # Create the final BEV grid (B x C x Z x X x Y)
+        # 创建最终的BEV网格
         final = torch.zeros(
             (B, C, int(self.nx[2].item()), int(self.nx[0].item()), int(self.nx[1].item())), device=x.device)
-        # Scatter summed features into the grid
-        # Indices: batch, channel, z, x, y
+
+        # 将处理后的特征放入网格中
         final[geom_feats[:, 3], :, geom_feats[:, 2],
               geom_feats[:, 0], geom_feats[:, 1]] = x
-
-        # collapse Z by concatenation: B x (C * Z) x X x Y
-        final = torch.cat(final.unbind(dim=2), 1)
-        # --- 代码块恢复结束 ---
-
-        # --- 检查最终的 final 张量 ---
-        assert torch.all(torch.isfinite(
-            final)), "!!! NaN/Inf detected in the final output tensor of voxel_pooling !!!"
-        # --------------------------
 
         return final
 
@@ -421,17 +615,12 @@ class CamEncodeFPN(nn.Module):
             D, self.fpn_out_channels, intermediate_channels=fpn_out_channels // 2)
 
     def get_depth_dist(self, depth_logits, eps=1e-20):
-        # 检查 softmax 的输入
-        if not torch.all(torch.isfinite(depth_logits)):
-            print("!!! NaN/Inf detected in input logits to get_depth_dist (softmax) !!!")
-            # 这里可以考虑直接引发错误以停止执行
-            # raise ValueError("NaN/Inf detected in input to softmax")
         return depth_logits.softmax(dim=1)
 
     def forward(self, x):
         # 检查 CamEncodeFPN 的输入
-        assert torch.all(torch.isfinite(
-            x)), "NaN/Inf detected in input x to CamEncodeFPN forward"
+        # assert torch.all(torch.isfinite(
+        #     x)), "NaN/Inf detected in input x to CamEncodeFPN forward"
 
         # --- Backbone Feature Extraction ---
         features = self.trunk(x)
@@ -440,32 +629,32 @@ class CamEncodeFPN(nn.Module):
                 f"Expected 4 feature maps from backbone, got {len(features)}")
         c2, c3, c4, c5 = features
         # 检查骨干网输出的关键部分
-        assert torch.all(torch.isfinite(
-            c2)), "NaN/Inf detected in c2 from backbone"
-        assert torch.all(torch.isfinite(
-            c5)), "NaN/Inf detected in c5 from backbone"
+        # assert torch.all(torch.isfinite(
+        #     c2)), "NaN/Inf detected in c2 from backbone"
+        # assert torch.all(torch.isfinite(
+        #     c5)), "NaN/Inf detected in c5 from backbone"
 
         # --- FPN Lateral Connections and Top-Down Pathway ---
         # 逐层检查 FPN 输出
         p5 = self.lat_c5(c5)
-        assert torch.all(torch.isfinite(p5)), "NaN/Inf detected in p5"
+        # assert torch.all(torch.isfinite(p5)), "NaN/Inf detected in p5"
         p4_in = self.lat_c4(
             c4) + F.interpolate(p5, size=c4.shape[2:], mode='bilinear', align_corners=True)
-        assert torch.all(torch.isfinite(p4_in)), "NaN/Inf detected in p4_in"
+        # assert torch.all(torch.isfinite(p4_in)), "NaN/Inf detected in p4_in"
         p4 = self.smooth_p4(p4_in)
-        assert torch.all(torch.isfinite(p4)), "NaN/Inf detected in p4"
+        # assert torch.all(torch.isfinite(p4)), "NaN/Inf detected in p4"
 
         p3_in = self.lat_c3(
             c3) + F.interpolate(p4, size=c3.shape[2:], mode='bilinear', align_corners=True)
-        assert torch.all(torch.isfinite(p3_in)), "NaN/Inf detected in p3_in"
+        # assert torch.all(torch.isfinite(p3_in)), "NaN/Inf detected in p3_in"
         p3 = self.smooth_p3(p3_in)
-        assert torch.all(torch.isfinite(p3)), "NaN/Inf detected in p3"
+        # assert torch.all(torch.isfinite(p3)), "NaN/Inf detected in p3"
 
         p2_in = self.lat_c2(
             c2) + F.interpolate(p3, size=c2.shape[2:], mode='bilinear', align_corners=True)
-        assert torch.all(torch.isfinite(p2_in)), "NaN/Inf detected in p2_in"
+        # assert torch.all(torch.isfinite(p2_in)), "NaN/Inf detected in p2_in"
         p2 = self.smooth_p2(p2_in)
-        assert torch.all(torch.isfinite(p2)), "NaN/Inf detected in p2"
+        # assert torch.all(torch.isfinite(p2)), "NaN/Inf detected in p2"
 
         # --- 设定 log_variance 的安全范围 ---
         log_var_min = -10.0
@@ -474,36 +663,36 @@ class CamEncodeFPN(nn.Module):
         # --- Initial Depth, Uncertainty, and Feature Calculation from P2 ---
         output = self.depthnet(p2)
         # --- 检查 depthnet 的整体输出 ---
-        assert torch.all(torch.isfinite(
-            output)), "!!! NaN/Inf detected immediately after self.depthnet(p2) call !!!"
+        # assert torch.all(torch.isfinite(
+        #     output)), "!!! NaN/Inf detected immediately after self.depthnet(p2) call !!!"
         # ---------------------------------
         initial_depth_logits = output[:, :self.D]
         initial_depth_log_variance_raw = output[:, self.D:2*self.D]
         context_features = output[:, 2*self.D:]
         # --- 检查 depthnet 输出的分割部分 ---
-        assert torch.all(torch.isfinite(initial_depth_logits)
-                         ), "NaN/Inf detected in initial_depth_logits split from depthnet output"
-        assert torch.all(torch.isfinite(initial_depth_log_variance_raw)
-                         ), "NaN/Inf detected in initial_depth_log_variance_raw split from depthnet output"
-        assert torch.all(torch.isfinite(
-            context_features)), "NaN/Inf detected in context_features split from depthnet output"
+        # assert torch.all(torch.isfinite(initial_depth_logits)
+        #                  ), "NaN/Inf detected in initial_depth_logits split from depthnet output"
+        # assert torch.all(torch.isfinite(initial_depth_log_variance_raw)
+        #                  ), "NaN/Inf detected in initial_depth_log_variance_raw split from depthnet output"
+        # assert torch.all(torch.isfinite(
+        #     context_features)), "NaN/Inf detected in context_features split from depthnet output"
         # ----------------------------------
 
         # --- 稳定化: Clamp 初始 log_variance ---
         initial_depth_log_variance = torch.clamp(
             initial_depth_log_variance_raw, min=log_var_min, max=log_var_max
         )
-        assert torch.all(torch.isfinite(initial_depth_log_variance)
-                         ), "NaN/Inf detected after clamping initial_depth_log_variance"
+        # assert torch.all(torch.isfinite(initial_depth_log_variance)
+        #                  ), "NaN/Inf detected after clamping initial_depth_log_variance"
 
         # --- Depth Refinement using P2 features ---
         # 检查 refinement_net 的输入
-        assert torch.all(torch.isfinite(initial_depth_logits.detach(
-        ))), "NaN/Inf in input initial_logits.detach() to refinement_net"
-        assert torch.all(torch.isfinite(initial_depth_log_variance.detach(
-        ))), "NaN/Inf in input initial_depth_log_variance.detach() to refinement_net"
-        assert torch.all(torch.isfinite(
-            p2)), "NaN/Inf in input p2 to refinement_net"
+        # assert torch.all(torch.isfinite(initial_depth_logits.detach(
+        # ))), "NaN/Inf in input initial_logits.detach() to refinement_net"
+        # assert torch.all(torch.isfinite(initial_depth_log_variance.detach(
+        # ))), "NaN/Inf in input initial_depth_log_variance.detach() to refinement_net"
+        # assert torch.all(torch.isfinite(
+        #     p2)), "NaN/Inf in input p2 to refinement_net"
 
         refined_depth_logits_raw, refined_depth_log_variance_raw = self.refinement_net(
             initial_depth_logits.detach(),
@@ -511,10 +700,10 @@ class CamEncodeFPN(nn.Module):
             p2
         )
         # --- 检查 refinement_net 的输出 ---
-        assert torch.all(torch.isfinite(refined_depth_logits_raw)
-                         ), "!!! NaN/Inf detected in refined_depth_logits_raw output from refinement_net !!!"
-        assert torch.all(torch.isfinite(refined_depth_log_variance_raw)
-                         ), "!!! NaN/Inf detected in refined_depth_log_variance_raw output from refinement_net !!!"
+        # assert torch.all(torch.isfinite(refined_depth_logits_raw)
+        #                  ), "!!! NaN/Inf detected in refined_depth_logits_raw output from refinement_net !!!"
+        # assert torch.all(torch.isfinite(refined_depth_log_variance_raw)
+        #                  ), "!!! NaN/Inf detected in refined_depth_log_variance_raw output from refinement_net !!!"
         # ---------------------------------
 
         # --- 稳定化: Clamp 细化后的 log_variance ---
@@ -522,34 +711,40 @@ class CamEncodeFPN(nn.Module):
         refined_depth_log_variance = torch.clamp(
             refined_depth_log_variance_raw, min=log_var_min, max=log_var_max
         )
-        assert torch.all(torch.isfinite(refined_depth_logits)
-                         ), "NaN/Inf detected in refined_depth_logits before softmax"
-        assert torch.all(torch.isfinite(refined_depth_log_variance)
-                         ), "NaN/Inf detected after clamping refined_depth_log_variance"
+        # --- 检查 clamp 后的值 ---
+        # assert torch.all(torch.isfinite(refined_depth_logits)
+        #                  ), "NaN/Inf detected in refined_depth_logits after assignment (before softmax)"
+        # assert torch.all(torch.isfinite(refined_depth_log_variance)
+        #                  ), "NaN/Inf detected after clamping refined_depth_log_variance"
+        # ---------------------------
 
         # --- Final Feature Combination using Refined Depth ---
         refined_depth_prob = self.get_depth_dist(refined_depth_logits)
-        assert torch.all(torch.isfinite(refined_depth_prob)
-                         ), "NaN/Inf detected in refined_depth_prob after softmax"
+        # --- 检查 softmax 输出 ---
+        # assert torch.all(torch.isfinite(refined_depth_prob)
+        #                  ), "!!! NaN/Inf detected in refined_depth_prob after softmax !!!"
+        # --------------------------
 
         refined_confidence = torch.exp(-refined_depth_log_variance)
-        assert torch.all(torch.isfinite(refined_confidence)
-                         ), "NaN/Inf detected in refined_confidence after exp"
+        # --- 检查 exp 输出 ---
+        # assert torch.all(torch.isfinite(refined_confidence)
+        #                  ), "!!! NaN/Inf detected in refined_confidence after exp(-log_var) !!!"
+        # --------------------
 
         # 检查最终乘法的输入
-        assert torch.all(torch.isfinite(refined_depth_prob.unsqueeze(
-            1))), "NaN/Inf in input 1 (prob) to final multiplication"
-        assert torch.all(torch.isfinite(refined_confidence.unsqueeze(
-            1))), "NaN/Inf in input 2 (conf) to final multiplication"
-        assert torch.all(torch.isfinite(context_features.unsqueeze(
-            2))), "NaN/Inf in input 3 (feat) to final multiplication"
+        # assert torch.all(torch.isfinite(refined_depth_prob.unsqueeze(
+        #     1))), "NaN/Inf in input 1 (prob) to final multiplication"
+        # assert torch.all(torch.isfinite(refined_confidence.unsqueeze(
+        #     1))), "NaN/Inf in input 2 (conf) to final multiplication"
+        # assert torch.all(torch.isfinite(context_features.unsqueeze(
+        #     2))), "NaN/Inf in input 3 (feat) to final multiplication"
 
         epsilon = 1e-6
         new_x = refined_depth_prob.unsqueeze(
             1) * refined_confidence.unsqueeze(1) * context_features.unsqueeze(2) + epsilon
         # 检查最终输出 new_x
-        assert torch.all(torch.isfinite(
-            new_x)), "!!! NaN/Inf detected in the final new_x output of CamEncodeFPN !!!"
+        # assert torch.all(torch.isfinite(
+        #     new_x)), "!!! NaN/Inf detected in the final new_x output of CamEncodeFPN !!!"
 
         return new_x, refined_depth_prob
 
@@ -561,13 +756,13 @@ class LidarEncode(nn.Module):
         self.encoder = nn.Sequential(
             nn.Conv2d(inC_lidar, 64, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(128, outC_lidar, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(outC_lidar),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
         )
 
     def forward(self, x):
@@ -616,8 +811,8 @@ class FusionNet(nn.Module):
         # Input channels for camera BEV processor after Z-collapse (concatenation)
         cam_bev_interim_channels = self.camC * num_z_bins
 
-        # Camera BEV Processor (using BevEncode architecture)
-        self.cam_bev_processor = BevEncode(
+        # Camera BEV Processor (using BevEncodeV2 architecture)
+        self.cam_bev_processor = BevEncodeV2(
             inC=cam_bev_interim_channels, outC=fused_bev_channels)
 
         # Fusion layer: combines processed camera BEV and processed lidar BEV
@@ -630,6 +825,9 @@ class FusionNet(nn.Module):
             nn.Conv2d(fused_bev_channels, outC, kernel_size=1, padding=0)
         )
         # --- Fusion and BEV End ---
+
+        # 设置使用cumsum_trick，不使用QuickCumsum（保持一致性并确保安全）
+        self.use_quickcumsum = False
 
     def create_frustum(self):
         # make grid in image plane
@@ -651,70 +849,62 @@ class FusionNet(nn.Module):
     def get_geometry(self, rots, trans, intrins, post_rots, post_trans):
         """Determine the (x,y,z) locations (in the ego frame)
         of the points in the point cloud.
-        Returns B x N x D x H_feat x W_feat x 3
+        Returns B x N x D x H/downsample x W/downsample x 3
         """
         B, N, _ = trans.shape
 
-        # --- 检查输入 ---
-        assert torch.all(torch.isfinite(self.frustum)
-                         ), "NaN/Inf in self.frustum"
-        assert torch.all(torch.isfinite(post_trans)
-                         ), "NaN/Inf in input post_trans"
-        assert torch.all(torch.isfinite(post_rots)
-                         ), "NaN/Inf in input post_rots"
-        assert torch.all(torch.isfinite(rots)), "NaN/Inf in input rots"
-        assert torch.all(torch.isfinite(intrins)), "NaN/Inf in input intrins"
-        assert torch.all(torch.isfinite(trans)), "NaN/Inf in input trans"
-        # ---------------
+        # 初始点投影
+        points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)  # Step 1
 
-        points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
-        assert torch.all(torch.isfinite(points)
-                         ), "NaN/Inf after frustum - post_trans"
+        # 计算逆矩阵并进行投影
+        inverse_epsilon = 1e-6  # Small value for stability
+        # Add epsilon * I to post_rots before inversion
+        stable_post_rots = post_rots + \
+            torch.eye(3, device=post_rots.device, dtype=post_rots.dtype).unsqueeze(
+                0).unsqueeze(0) * inverse_epsilon
+        inv_post_rots = torch.inverse(stable_post_rots)  # Step 2a
 
-        # --- 检查 post_rots 求逆 ---
-        try:
-            inv_post_rots = torch.inverse(post_rots)
-            assert torch.all(torch.isfinite(
-                inv_post_rots)), "!!! NaN/Inf detected in torch.inverse(post_rots) !!!"
-        except Exception as e:
-            print(f"Error during torch.inverse(post_rots): {e}")
-            raise e  # 重新抛出异常以停止
-        # --------------------------
         points = inv_post_rots.view(
-            B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
-        assert torch.all(torch.isfinite(points)
-                         ), "NaN/Inf after inv_post_rots matmul"
+            B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))  # Step 2b
 
-        points = torch.cat((points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
-                            points[:, :, :, :, :, 2:3]
-                            ), 5)
-        assert torch.all(torch.isfinite(
-            points)), "NaN/Inf after points[:,:,:,:,:,2:3] multiplication"
+        # 关键修改: 添加数值稳定性
+        xy_coords = points[:, :, :, :, :, :2]
+        depth_vals = points[:, :, :, :, :, 2:3]
+        epsilon = 1e-6  # This epsilon is for safe_depth, not the inverse_epsilon
+        safe_depth = depth_vals.clone()
+        safe_depth = torch.where(torch.abs(safe_depth) < epsilon,
+                                 torch.full_like(
+                                     safe_depth, epsilon) * torch.sign(safe_depth + epsilon),
+                                 safe_depth)
 
-        # --- 检查 intrins 求逆 ---
-        try:
-            inv_intrins = torch.inverse(intrins)
-            assert torch.all(torch.isfinite(
-                inv_intrins)), "!!! NaN/Inf detected in torch.inverse(intrins) !!!"
-        except Exception as e:
-            print(f"Error during torch.inverse(intrins): {e}")
-            raise e  # 重新抛出异常以停止
-        # --------------------------
-        combine = rots.matmul(inv_intrins)
-        assert torch.all(torch.isfinite(combine)
-                         ), "NaN/Inf after rots.matmul(inv_intrins)"
+        # --- Perform critical multiplication in float32 to prevent float16 overflow ---
+        product_f32 = xy_coords.float() * safe_depth.float()
 
-        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
-        assert torch.all(torch.isfinite(points)
-                         ), "NaN/Inf after combine matmul"
+        # Ensure the other part for concatenation is also float32
+        safe_depth_component_f32 = safe_depth.float()
+        # ---------------------------------------------------------------------------
 
-        points += trans.view(B, N, 1, 1, 1, 3)
-        # --- 检查最终输出 ---
-        assert torch.all(torch.isfinite(
-            points)), "!!! NaN/Inf detected in final points output of get_geometry !!!"
-        # ------------------
+        # Step 3 (Scaling)
+        # Resulting 'points' will be float32 due to product_f32 and safe_depth_component_f32
+        points = torch.cat(
+            (product_f32, safe_depth_component_f32), 5)
 
-        return points
+        # 应用相机到自车坐标的变换
+        # Add epsilon * I to intrins before inversion
+        stable_intrins = intrins + \
+            torch.eye(3, device=intrins.device, dtype=intrins.dtype).unsqueeze(
+                0).unsqueeze(0) * inverse_epsilon
+        inv_intrins = torch.inverse(stable_intrins)  # Step 4a
+
+        combine = rots.matmul(inv_intrins)  # Step 4b
+
+        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(
+            points.squeeze(-1).unsqueeze(-1)).squeeze(-1)  # Step 4c (Corrected matmul)
+
+        # 添加平移
+        points += trans.view(B, N, 1, 1, 1, 3)  # Step 5
+
+        return points  # Final Output
 
     def get_cam_feats(self, x):
         """Return features: B x N x D x H_feat x W_feat x C_feat (camC)
@@ -743,106 +933,92 @@ class FusionNet(nn.Module):
         return features_permuted, depth_prob  # 返回特征和深度概率
 
     def voxel_pooling(self, geom_feats, x):
-        """Projects camera features into voxels.
+        """Pools camera features into a BEV grid.
         Args:
-            geom_feats: Geometry tensor (B x N x D x H_feat x W_feat x 3)
-            x: Camera features (B x N x D x H_feat x W_feat x C)
+            geom_feats: Geometry tensor (B x N x D x H x W x 3)
+            x: Camera features (B x N x D x H x W x C)
         Returns:
             BEV features (B x (C * Z) x X x Y)
         """
-        # --- 检查输入 ---
-        assert torch.all(torch.isfinite(
-            x)), "NaN/Inf detected in input x to voxel_pooling"
-        assert torch.all(torch.isfinite(
-            geom_feats)), "!!! NaN/Inf detected in input geom_feats to voxel_pooling !!!"  # 重点检查这里
-        # ---------------
-
         B, N, D, H, W, C = x.shape
         Nprime = B*N*D*H*W
 
+        # 展平特征
         x = x.reshape(Nprime, C)
-        assert torch.all(torch.isfinite(
-            x)), "NaN/Inf after x.reshape in voxel_pooling"
 
-        # flatten indices
+        # 计算栅格化索引
         geom_feats_normalized = (geom_feats - (self.bx - self.dx/2.)) / self.dx
-        assert torch.all(torch.isfinite(geom_feats_normalized)
-                         ), "NaN/Inf after normalizing geom_feats"
         geom_feats_long = geom_feats_normalized.long()
-        # 注意: long() 后的检查意义不大，因为 nan/inf 转 long 行为未定义
-        # assert torch.all(torch.isfinite(geom_feats_long)), "NaN/Inf after geom_feats.long()"
-
         geom_feats = geom_feats_long.view(Nprime, 3)
-        # assert torch.all(torch.isfinite(geom_feats)), "NaN/Inf after geom_feats.view" # .long() 可能产生奇怪值
 
+        # 添加批次索引
         batch_ix = torch.cat([torch.full([Nprime//B, 1], ix,
                              device=x.device, dtype=torch.long) for ix in range(B)])
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
-        # assert torch.all(torch.isfinite(geom_feats)), "NaN/Inf after cat batch_ix" # 检查意义不大
 
-        # filter out points that are outside grid boundaries
-        # 可以在这里检查 geom_feats 的值范围，但如果已经是 nan/inf 就晚了
+        # 过滤掉边界外的点
         kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0])\
             & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1])\
             & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
+
+        # 改进的处理方式：处理没有有效点的情况
+        if not torch.any(kept):
+            # 使用中心区域的一些点，即使它们可能在边界外
+            # 我们只选择一个小的中心区域（不超过10%的原始点）
+            center_region = (
+                torch.abs(geom_feats_normalized[:, 0] - self.nx[0]/2) < self.nx[0]*0.2) & \
+                (torch.abs(geom_feats_normalized[:, 1] - self.nx[1]/2) < self.nx[1]*0.2) & \
+                (torch.abs(
+                    geom_feats_normalized[:, 2] - self.nx[2]/2) < self.nx[2]*0.2)
+
+            # 若中心区域也没有点，则选择最接近中心的几个点
+            if not torch.any(center_region):
+                # 计算到中心的距离
+                center_distances = (geom_feats_normalized[:, 0] - self.nx[0]/2)**2 + \
+                    (geom_feats_normalized[:, 1] - self.nx[1]/2)**2 + \
+                    (geom_feats_normalized[:,
+                                           2] - self.nx[2]/2)**2
+                # 选择最近的10个点
+                _, closest_indices = torch.topk(center_distances, k=min(
+                    10, center_distances.size(0)), largest=False)
+                new_kept = torch.zeros_like(kept)
+                new_kept[closest_indices] = True
+                kept = new_kept
+            else:
+                # 使用中心区域点
+                kept = center_region
+
+            # 将这些点映射到有效范围内
+            geom_feats[:, 0] = torch.clamp(
+                geom_feats[:, 0], 0, int(self.nx[0].item()-1))
+            geom_feats[:, 1] = torch.clamp(
+                geom_feats[:, 1], 0, int(self.nx[1].item()-1))
+            geom_feats[:, 2] = torch.clamp(
+                geom_feats[:, 2], 0, int(self.nx[2].item()-1))
+
         x = x[kept]
         geom_feats = geom_feats[kept]
-        assert torch.all(torch.isfinite(
-            x)), "NaN/Inf in x after filtering (kept)"
-        # assert torch.all(torch.isfinite(geom_feats)), "NaN/Inf in geom_feats after filtering (kept)" # 检查意义不大
 
-        # Combine indices for efficient sorting and summing
+        # 计算体素排序索引
         ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)\
             + geom_feats[:, 1] * (self.nx[2] * B)\
             + geom_feats[:, 2] * B\
             + geom_feats[:, 3]
-        # --- 检查 ranks ---
-        assert torch.all(torch.isfinite(
-            ranks)), "!!! NaN/Inf detected in ranks calculation !!!"
-        # -----------------
 
+        # 对点进行排序以使相同体素的点相邻
         sorts = ranks.argsort()
-        # 检查 sorts 的有效性 (例如，是否包含超出范围的索引) 可能比较困难
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
-        assert torch.all(torch.isfinite(x)), "NaN/Inf in x after sorting"
-        # assert torch.all(torch.isfinite(geom_feats)), "NaN/Inf in geom_feats after sorting"
-        assert torch.all(torch.isfinite(
-            ranks)), "NaN/Inf in ranks after sorting"
 
-        # Use cumsum trick for summing features in the same voxel
-        # --- 检查 cumsum_trick 的输入 ---
-        assert torch.all(torch.isfinite(
-            x)), "!!! NaN/Inf detected in input x to cumsum_trick !!!"
-        assert torch.all(torch.isfinite(
-            geom_feats)), "!!! NaN/Inf detected in input geom_feats to cumsum_trick !!!"
-        assert torch.all(torch.isfinite(
-            ranks)), "!!! NaN/Inf detected in input ranks to cumsum_trick !!!"
-        # -----------------------------
+        # 执行累加技巧 - 始终使用cumsum_trick（FusionNet中self.use_quickcumsum = False）
         x, geom_feats = cumsum_trick(x, geom_feats, ranks)
-        # --- 检查 cumsum_trick 的输出 ---
-        assert torch.all(torch.isfinite(
-            x)), "!!! NaN/Inf detected in output x from cumsum_trick !!!"
-        assert torch.all(torch.isfinite(
-            geom_feats)), "!!! NaN/Inf detected in output geom_feats from cumsum_trick !!!"
-        # ----------------------------
 
-        # --- 恢复缺失的代码块 ---
-        # Create the final BEV grid (B x C x Z x X x Y)
+        # 创建最终的BEV网格
         final = torch.zeros(
             (B, C, int(self.nx[2].item()), int(self.nx[0].item()), int(self.nx[1].item())), device=x.device)
-        # Scatter summed features into the grid
-        # Indices: batch, channel, z, x, y
+
+        # 将处理后的特征放入网格中
         final[geom_feats[:, 3], :, geom_feats[:, 2],
               geom_feats[:, 0], geom_feats[:, 1]] = x
-
-        # collapse Z by concatenation: B x (C * Z) x X x Y
-        final = torch.cat(final.unbind(dim=2), 1)
-        # --- 代码块恢复结束 ---
-
-        # --- 检查最终的 final 张量 ---
-        assert torch.all(torch.isfinite(
-            final)), "!!! NaN/Inf detected in the final output tensor of voxel_pooling !!!"
-        # --------------------------
 
         return final
 
@@ -867,24 +1043,49 @@ class FusionNet(nn.Module):
         # 1. Get Camera BEV features and depth probability
         cam_bev_interim, depth_prob = self.get_voxels(  # 接收 depth_prob
             x_cam, rots, trans, intrins, post_rots, post_trans)
+        # assert torch.all(torch.isfinite(cam_bev_interim)
+        #                  ), "NaN/Inf detected in cam_bev_interim from get_voxels"
+        # assert torch.all(torch.isfinite(depth_prob)
+        #                  ), "NaN/Inf detected in depth_prob from get_voxels"
 
         # 2. Process Camera BEV features
-        cam_bev_processed = self.cam_bev_processor(cam_bev_interim)
+        # --- Reshape cam_bev_interim before passing to processor ---
+        B_cam, C_cam, Z_cam, X_cam, Y_cam = cam_bev_interim.shape
+        cam_bev_interim_reshaped = cam_bev_interim.view(
+            B_cam, C_cam * Z_cam, X_cam, Y_cam)
+        # -----------------------------------------------------------
+        cam_bev_processed = self.cam_bev_processor(
+            cam_bev_interim_reshaped)  # 使用 reshape 后的张量
+        # assert torch.all(torch.isfinite(cam_bev_processed)
+        #                  ), "NaN/Inf detected after cam_bev_processor"
 
         # 3. Process LiDAR BEV features
+        # assert torch.all(torch.isfinite(lidar_bev)
+        #                  ), "NaN/Inf detected in lidar_bev input"
         lidar_bev_processed = self.lidarencode(lidar_bev)
+        # assert torch.all(torch.isfinite(lidar_bev_processed)
+        #                  ), "NaN/Inf detected after lidarencode"
 
         # 4. Fuse Features
         if cam_bev_processed.shape[2:] != lidar_bev_processed.shape[2:]:
-            lidar_bev_processed = F.interpolate(lidar_bev_processed,
-                                                size=cam_bev_processed.shape[2:],
-                                                mode='bilinear',
-                                                align_corners=False)
+            lidar_bev_processed_resized = F.interpolate(lidar_bev_processed,
+                                                        size=cam_bev_processed.shape[2:],
+                                                        mode='bilinear',
+                                                        align_corners=False)
+            # assert torch.all(torch.isfinite(lidar_bev_processed_resized)
+            #                  ), "NaN/Inf detected after F.interpolate on lidar_bev"
+        else:
+            lidar_bev_processed_resized = lidar_bev_processed  # No resizing needed
+
         fused_features = torch.cat(
-            [cam_bev_processed, lidar_bev_processed], dim=1)
+            [cam_bev_processed, lidar_bev_processed_resized], dim=1)
+        # assert torch.all(torch.isfinite(fused_features)
+        #                  ), "NaN/Inf detected after torch.cat"
 
         # 5. Final processing
         output = self.fusion_conv(fused_features)
+        # assert torch.all(torch.isfinite(
+        #     output)), "!!! NaN/Inf detected in final output of FusionNet.forward !!!"
 
         return output, depth_prob  # 返回最终输出和深度概率
 

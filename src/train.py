@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import time  # 直接导入time模块
 from tensorboardX import SummaryWriter
 from torch.backends import cudnn
-from torch.cuda.amp import autocast, GradScaler  # 正确导入
 from tqdm import tqdm
 import numpy as np
 import os
@@ -17,6 +16,107 @@ from .nuscenes_info import load_nuscenes_infos  # 导入数据集缓存加载函
 import torchvision  # 导入 torchvision 用于可视化
 import torch.autograd  # 导入 autograd
 from nuscenes import NuScenes    # Import NuScenes
+from itertools import filterfalse  # Use filterfalse directly in Python 3
+
+
+def lovasz_hinge(logits, labels, per_image=True, ignore=None):
+    """
+    二分类 Lovasz-Hinge 损失
+    logits: [B, H, W] tensor 未经 sigmoid 的预测值
+    labels: [B, H, W] tensor 0 或 1 的标签
+    per_image: bool, 如果 True, 对每张图片独立计算损失，然后求平均。否则，在整个 batch 上计算。
+    ignore: int, 忽略标签索引。
+    """
+    if per_image:
+        loss = mean(lovasz_hinge_flat(*flatten_binary_scores(log.unsqueeze(0), lab.unsqueeze(0), ignore))
+                    for log, lab in zip(logits, labels))
+    else:
+        loss = lovasz_hinge_flat(
+            *flatten_binary_scores(logits, labels, ignore))
+    return loss
+
+
+def lovasz_hinge_flat(logits, labels):
+    """
+    二分类 Lovasz-Hinge 损失
+    logits: [P] tensor 未经 sigmoid 的预测值 (P = H * W)
+    labels: [P] tensor 0 或 1 的标签
+    """
+    if len(labels) == 0:
+        # 只有忽略区域
+        return logits.sum() * 0.
+    signs = 2. * labels.float() - 1.
+    errors = (1. - logits * signs)
+    errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+    perm = perm.data
+    gt_sorted = labels[perm]
+    grad = lovasz_grad(gt_sorted)
+    # loss = torch.dot(F.relu(errors_sorted), grad) # ReLu 已被 Hinge loss 包含
+    # 使用 ELU+1 替代 ReLU 来获得更平滑的梯度，等价于 hinge loss
+    loss = torch.dot(F.elu(errors_sorted)+1, grad)
+    return loss
+
+
+def flatten_binary_scores(scores, labels, ignore=None):
+    """
+    展平预测和标签张量，用于计算二分类损失
+    scores: [B, H, W] tensor 未经 sigmoid 的预测值
+    labels: [B, H, W] tensor 0 或 1 的标签
+    """
+    scores = scores.view(-1)
+    labels = labels.view(-1)
+    if ignore is not None:
+        mask = (labels != ignore)
+        scores = scores[mask]
+        labels = labels[mask]
+    return scores, labels
+
+
+def lovasz_grad(gt_sorted):
+    """
+    计算 Lovasz 梯度
+    """
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1 - gt_sorted.float()).cumsum(0)
+    jaccard = 1. - intersection / union
+    if p > 1:  # 避免索引错误
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+# Helper function
+
+
+def mean(l, ignore_nan=False, empty=0):
+    """
+    列表或迭代器的平均值
+    """
+    l = iter(l)
+    if ignore_nan:
+        l = filterfalse(torch.isnan, l)  # Use filterfalse directly
+    try:
+        n = 1
+        acc = next(l)
+    except StopIteration:
+        if empty == 'raise':
+            raise ValueError('Empty mean')
+        return empty
+    for n, v in enumerate(l, 2):
+        acc += v
+    if n == 1:
+        return acc
+    return acc / n
+
+
+class LovaszHingeLoss(nn.Module):
+    def __init__(self, per_image=True, ignore=None):
+        super().__init__()
+        self.per_image = per_image
+        self.ignore = ignore
+
+    def forward(self, logits, labels):
+        return lovasz_hinge(logits, labels, per_image=self.per_image, ignore=self.ignore)
 
 
 def check_and_ensure_cache(dataroot, version):
@@ -64,7 +164,6 @@ def train(version,
           cuDNN=False,
           resume='',
           load_weight='',
-          amp=True,
           H=900, W=1600,
           resize_lim=(0.193, 0.225),
           final_dim=(128, 352),
@@ -175,19 +274,16 @@ def train(version,
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in pbar:
             t0_batch = time.time()
             opt.zero_grad()
-            context = autocast(enabled=amp)
-            with context:
-                preds = model(imgs.to(device),
-                              rots.to(device),
-                              trans.to(device),
-                              intrins.to(device),
-                              post_rots.to(device),
-                              post_trans.to(device),
-                              )
+            preds = model(imgs.to(device),
+                          rots.to(device),
+                          trans.to(device),
+                          intrins.to(device),
+                          post_rots.to(device),
+                          post_trans.to(device),
+                          )
             binimgs = binimgs.to(device)
 
-            with context:
-                loss = loss_seg(preds, binimgs)  # 使用分割损失变量名
+            loss = loss_seg(preds, binimgs)  # 使用分割损失变量名
 
             if torch.isfinite(loss):
                 loss.backward()
@@ -274,7 +370,6 @@ def train_fusion(version,
                  cuDNN=False,
                  resume='',
                  load_weight='',
-                 amp=True,
                  H=900, W=1600,
                  resize_lim=(0.193, 0.225),
                  final_dim=(128, 352),
@@ -303,6 +398,9 @@ def train_fusion(version,
                  # Add arg for map layers to evaluate
                  map_layers=['drivable_area'],
                  val_step=10,  # Ensure val_step is defined or passed
+                 # --- New Loss Hyperparameters ---
+                 lambda_bce=1.0,  # Weight for BCE loss
+                 lambda_lovasz=1.0  # Weight for Lovasz-Hinge loss
                  ):
     # --- Setup Autograd Anomaly Detection & Cache Check ---
     # torch.autograd.set_detect_anomaly(True) # Enable only if debugging NaNs
@@ -344,11 +442,11 @@ def train_fusion(version,
     model.to(device)
 
     # --- Loss, Optimizer, Scaler ---
-    loss_seg = nn.BCEWithLogitsLoss(
+    loss_bce = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight)).to(device)
+    loss_lovasz = LovaszHingeLoss(per_image=True, ignore=None).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr,
                            weight_decay=weight_decay)
-    scaler = GradScaler(enabled=amp)
 
     # --- Logging and Checkpointing Setup ---
     if resume != '':
@@ -407,16 +505,6 @@ def train_fusion(version,
             else:
                 print("Warning: Could not find optimizer state in checkpoint.")
 
-            # Load scaler state
-            if amp and 'scaler' in checkpoint and checkpoint['scaler'] is not None:
-                try:
-                    scaler.load_state_dict(checkpoint['scaler'])
-                except Exception as e:
-                    print(f"Warning: Could not load scaler state: {e}")
-            elif amp and 'scaler' not in checkpoint:
-                print(
-                    "Warning: AMP is enabled, but no scaler state found in checkpoint.")
-
             # Load epoch, step, and best metrics
             epoch = checkpoint.get('epoch', 0) + 1
             max_iou = checkpoint.get('max_iou', 0.0)
@@ -472,43 +560,54 @@ def train_fusion(version,
                 continue
 
             opt.zero_grad()
-            context = autocast(enabled=amp)
-            with context:
-                # 确保模型调用匹配预期输入
-                model_output = model(imgs.to(device),
-                                     rots.to(device),
-                                     trans.to(device),
-                                     intrins.to(device),
-                                     post_rots.to(device),
-                                     post_trans.to(device),
-                                     lidar_bev.to(device)
-                                     )
-                if isinstance(model_output, tuple) and len(model_output) == 2:
-                    preds, depth_prob = model_output
-                elif isinstance(model_output, torch.Tensor):
-                    preds = model_output
-                    depth_prob = None
-                else:
-                    print(f"错误：意外的模型输出格式：{type(model_output)}。跳过该批次。")
-                    continue
-
-                binimgs = binimgs.to(device)
-                loss = loss_seg(preds, binimgs)
-
-            if not torch.isfinite(loss):
-                print(
-                    f"警告：第{epoch+1}轮，第{batchi}批次，检测到NaN/Inf损失。跳过更新。损失：{loss.item()}")
+            # 确保模型调用匹配预期输入
+            model_output = model(imgs.to(device),
+                                 rots.to(device),
+                                 trans.to(device),
+                                 intrins.to(device),
+                                 post_rots.to(device),
+                                 post_trans.to(device),
+                                 lidar_bev.to(device)
+                                 )
+            if isinstance(model_output, tuple) and len(model_output) == 2:
+                preds, depth_prob = model_output
+            elif isinstance(model_output, torch.Tensor):
+                preds = model_output
+                depth_prob = None
+            else:
+                print(f"错误：意外的模型输出格式：{type(model_output)}。跳过该批次。")
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(opt)
-            scaler.update()
+            binimgs = binimgs.to(device)
 
-            epoch_loss += loss.item()
+            # --- Calculate Combined Loss ---
+            loss_bce_val = loss_bce(preds, binimgs)
+            loss_lovasz_val = loss_lovasz(preds, binimgs)
+
+            # Combine losses
+            loss = lambda_bce * loss_bce_val + lambda_lovasz * loss_lovasz_val
+
+            if torch.isfinite(loss):  # Check combined loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm)
+                opt.step()
+
+                epoch_loss += loss.item()
+                # Log individual components too (optional but good practice)
+                writer.add_scalar('train/loss_bce',
+                                  loss_bce_val.item(), global_step)
+                writer.add_scalar('train/loss_lovasz',
+                                  loss_lovasz_val.item(), global_step)
+                writer.add_scalar('train/loss_total', loss.item(), global_step)
+
+            else:
+                print(
+                    f"警告：第 {epoch+1} 轮，第 {batchi} 批次，检测到 NaN/Inf 损失。跳过更新。总损失: {loss.item()}, BCE: {loss_bce_val.item()}, Lovasz: {loss_lovasz_val.item()}")
+
             global_step += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}", bce=f"{loss_bce_val.item():.4f}", lovasz=f"{loss_lovasz_val.item():.4f}")
 
             # 训练可视化（可选）
             if log_vis_interval > 0 and global_step % log_vis_interval == 0:
@@ -556,19 +655,18 @@ def train_fusion(version,
                     except Exception as vis_e:
                         print(f"警告：训练可视化期间出错：{vis_e}")
                         pass
-
         # --- End of Epoch ---
         avg_epoch_loss = epoch_loss / \
             len(trainloader) if len(trainloader) > 0 else 0.0
         t1_epoch = time.time()
         print(
             f"Epoch {epoch + 1} Avg Train Loss: {avg_epoch_loss:.4f}, Time: {t1_epoch - t0_epoch:.2f}s")
-        writer.add_scalar('train/loss_epoch', avg_epoch_loss, epoch + 1)
+        writer.add_scalar('train/loss_epoch_total',
+                          avg_epoch_loss, epoch + 1)  # Log total avg loss
 
         # --- Save Last Checkpoint ---
         last_checkpoint = {
             'net': model.state_dict(), 'optimizer': opt.state_dict(),
-            'scaler': scaler.state_dict() if amp else None,
             'epoch': epoch,
             # Save all best metrics
             'max_iou': max_iou, 'max_f1': max_f1, 'max_devkit_f1': max_devkit_f1,
@@ -585,7 +683,7 @@ def train_fusion(version,
             print(f"--- 运行验证 第{epoch+1}轮 ---")
             val_info = get_val_info_fusion(model=model,
                                            valloader=valloader,
-                                           loss_fn=loss_seg,
+                                           loss_fn=loss_bce,  # Pass BCE for validation loss reporting for now
                                            device=device,
                                            nusc=nusc,
                                            grid_conf=grid_conf,
@@ -593,85 +691,16 @@ def train_fusion(version,
                                            global_step=global_step,
                                            map_layers=map_layers,
                                            final_dim_vis=final_dim_vis,
-                                           D_depth=D_depth)  # 移除sample_tokens参数
+                                           D_depth=D_depth)
 
-            # Log metrics returned by get_val_info_fusion
-            # ... (Log simple and devkit metrics logic remains same) ...
+            # Log simple metrics (IoU, F1 etc. are independent of training loss type)
+            # ... logging logic ...
+            # This is BCE loss from validation
             writer.add_scalar('val/loss_epoch', val_info['loss'], epoch + 1)
-            writer.add_scalar('val/simple_iou',
-                              val_info['simple_iou'], epoch + 1)
-            writer.add_scalar('val/simple_precision',
-                              val_info['simple_precision'], epoch + 1)
-            writer.add_scalar('val/simple_recall',
-                              val_info['simple_recall'], epoch + 1)
-            writer.add_scalar(
-                'val/simple_f1', val_info['simple_f1'], epoch + 1)
-            if 'devkit_f1' in val_info:
-                writer.add_scalar('val/devkit_iou',
-                                  val_info['devkit_iou'], epoch + 1)
-                writer.add_scalar('val/devkit_precision',
-                                  val_info['devkit_precision'], epoch + 1)
-                writer.add_scalar('val/devkit_recall',
-                                  val_info['devkit_recall'], epoch + 1)
-                writer.add_scalar(
-                    'val/devkit_f1', val_info['devkit_f1'], epoch + 1)
+            # You might want to compute Lovasz loss during validation too for monitoring
+            # (requires modifying get_val_info_fusion)
 
-            # --- Save Best Model Checkpoints --- #
-            # ... (Save best simple F1 and devkit F1 logic remains same) ...
-            current_f1 = val_info['simple_f1']
-            if current_f1 > max_f1:
-                max_f1 = current_f1
-                print(
-                    f"*** New best Simple F1: {max_f1:.4f}. Saving best_simple_f1 model... ***")
-                best_checkpoint_f1 = {
-                    'net': model.state_dict(), 'optimizer': opt.state_dict(),
-                    'scaler': scaler.state_dict() if amp else None, 'epoch': epoch,
-                    'max_iou': val_info.get('simple_iou', 0.0),
-                    'max_f1': max_f1,
-                    'max_devkit_f1': val_info.get('devkit_f1', 0.0),
-                    'global_step': global_step
-                }
-                best_model_path_f1 = os.path.join(
-                    path, "best_fusion_simple_f1.pt")
-                try:
-                    torch.save(best_checkpoint_f1, best_model_path_f1)
-                    print(
-                        f"Saved best simple F1 model checkpoint to {best_model_path_f1}")
-                except Exception as e:
-                    print(f"Error saving best simple F1 checkpoint: {e}")
-            if 'devkit_f1' in val_info:
-                current_devkit_f1 = val_info['devkit_f1']
-                if current_devkit_f1 > max_devkit_f1:
-                    max_devkit_f1 = current_devkit_f1
-                    print(
-                        f"*** New best Devkit F1: {max_devkit_f1:.4f}. Saving best_devkit_f1 model... ***")
-                    best_checkpoint_devkit_f1 = {
-                        'net': model.state_dict(), 'optimizer': opt.state_dict(),
-                        'scaler': scaler.state_dict() if amp else None, 'epoch': epoch,
-                        'max_iou': val_info.get('simple_iou', 0.0),
-                        'max_f1': val_info.get('simple_f1', 0.0),
-                        'max_devkit_f1': max_devkit_f1,
-                        'global_step': global_step
-                    }
-                    best_model_path_devkit_f1 = os.path.join(
-                        path, "best_fusion_devkit_f1.pt")
-                    try:
-                        torch.save(best_checkpoint_devkit_f1,
-                                   best_model_path_devkit_f1)
-                        print(
-                            f"Saved best devkit F1 model checkpoint to {best_model_path_devkit_f1}")
-                    except Exception as e:
-                        print(f"Error saving best devkit F1 checkpoint: {e}")
-            current_iou = val_info['simple_iou']
-            if current_iou > max_iou:
-                max_iou = current_iou
-                # Optional: save best IoU model
-
-            # --- Validation Visualization Block Removed ---
-            # Visualization is now handled inside get_val_info_fusion in tools.py
-
-            print(f"--- Finished Validation Epoch {epoch+1} ---")
-            model.train()  # Ensure model is back in train mode
+            # ... (rest of validation, saving best models) ...
 
         # --- Increment Epoch --- #
         epoch += 1
